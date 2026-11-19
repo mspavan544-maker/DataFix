@@ -1,423 +1,388 @@
 import streamlit as st
-import pandas as pd
-import io
-import os
-import zipfile
+import io, os, zipfile, difflib
+import xml.etree.ElementTree as ET
 from datetime import datetime
-
 from pypdf import PdfReader, PdfWriter
 from docx import Document
 from openpyxl import load_workbook
 from pptx import Presentation
 
+st.set_page_config(page_title="DataFix - File Repair Center", page_icon="🛠️", layout="wide")
 
-# ---------------- PAGE CONFIG ----------------
+# ---------- File identification and inspection ----------
 
-st.set_page_config(
-    page_title="DataFix - File Repair Center",
-    page_icon="🛠️",
-    layout="wide"
-)
-
-
-# ---------------- DESIGN ----------------
-
-st.title("🛠️ DataFix")
-st.subheader("Universal File Identification & Repair Center")
-
-st.write(
-    "Identify, inspect, detect errors and repair your files. "
-    "Download repaired files in their original format."
-)
-
-st.divider()
-
-st.info(
-    "Supported formats: PDF, Word DOCX, Excel XLSX and PowerPoint PPTX."
-)
-
-
-# ---------------- FILE IDENTIFICATION ----------------
-
-def identify_file(file_name, file_bytes):
-
-    extension = os.path.splitext(file_name)[1].lower()
-
-    if extension == ".pdf":
-        if b"%PDF" in file_bytes[:1024]:
-            return "PDF"
-        return "PDF (signature warning)"
-
-    if extension in [".docx", ".xlsx", ".pptx"]:
-
-        if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
-            return "Damaged Office file"
-
+def identify_file(name, data):
+    ext = os.path.splitext(name)[1].lower()
+    if ext == ".pdf":
+        return "PDF" if b"%PDF" in data[:1024] else "PDF (signature warning)"
+    required = {
+        ".docx": ("Word DOCX", "word/document.xml"),
+        ".xlsx": ("Excel XLSX", "xl/workbook.xml"),
+        ".pptx": ("PowerPoint PPTX", "ppt/presentation.xml"),
+    }
+    if ext in required:
+        label, part = required[ext]
         try:
-            with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-                names = z.namelist()
-
-                if "word/document.xml" in names:
-                    return "Word DOCX"
-
-                if "xl/workbook.xml" in names:
-                    return "Excel XLSX"
-
-                if "ppt/presentation.xml" in names:
-                    return "PowerPoint PPTX"
-
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                return label if part in z.namelist() else f"{label} (required component missing)"
         except Exception:
             return "Damaged Office file"
-
     return "Unsupported file format"
 
 
-# ---------------- ZIP VALIDATION ----------------
+def inspect_zip(data, main_part):
+    findings, errors = [], []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = z.namelist()
+            bad = z.testzip()
+            if bad:
+                errors.append(f"ZIP integrity check failed: {bad}")
+            else:
+                findings.append("ZIP container integrity check passed.")
+            if main_part not in names:
+                errors.append(f"Required component is missing: {main_part}")
+            xml_count = 0
+            for name in names:
+                if name.lower().endswith(".xml"):
+                    xml_count += 1
+                    try:
+                        ET.fromstring(z.read(name))
+                    except Exception as exc:
+                        errors.append(f"Invalid XML component {name}: {exc}")
+            if not any("Invalid XML" in e for e in errors):
+                findings.append(f"All {xml_count} XML component(s) parsed successfully.")
+    except Exception as exc:
+        errors.append(f"Could not read Office ZIP structure: {exc}")
+    return findings, errors
 
-def check_zip(file_bytes):
+
+# ---------- Extract readable content for before/after comparison ----------
+
+def extract_pdf(data):
+    reader = PdfReader(io.BytesIO(data), strict=False)
+    if reader.is_encrypted:
+        raise ValueError("Password-protected PDFs are not supported.")
+    pages, lines, warnings = [], [], []
+    for i, page in enumerate(reader.pages, 1):
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:
+            text = ""
+            warnings.append(f"Page {i}: text extraction failed: {exc}")
+        pages.append(text)
+        lines.append(f"PAGE {i}\n{text}")
+    metadata = {str(k): str(v) for k, v in (reader.metadata or {}).items() if v is not None}
+    return {
+        "lines": lines, "metadata": metadata, "warnings": warnings,
+        "summary": {
+            "Pages": len(reader.pages),
+            "Metadata fields": len(metadata),
+            "Pages with extractable text": sum(bool(x.strip()) for x in pages),
+        },
+    }
+
+
+def extract_docx(data):
+    doc = Document(io.BytesIO(data))
+    lines = [f"Paragraph {i}: {p.text}" for i, p in enumerate(doc.paragraphs, 1)]
+    for ti, table in enumerate(doc.tables, 1):
+        lines.append(f"TABLE {ti}")
+        for ri, row in enumerate(table.rows, 1):
+            lines.append(f"Row {ri}: " + " | ".join(c.text for c in row.cells))
+    return {"lines": lines, "summary": {
+        "Paragraphs": len(doc.paragraphs), "Tables": len(doc.tables),
+        "Sections": len(doc.sections),
+        "Non-empty paragraphs": sum(bool(p.text.strip()) for p in doc.paragraphs),
+    }, "warnings": []}
+
+
+def extract_xlsx(data):
+    wb = load_workbook(io.BytesIO(data), data_only=False, keep_links=True)
+    lines, sheets, cells, formulas = [], {}, 0, 0
+    for ws in wb.worksheets:
+        sheets[ws.title] = {"Rows": ws.max_row, "Columns": ws.max_column}
+        lines.append(f"WORKSHEET: {ws.title}")
+        for row in ws.iter_rows():
+            values = []
+            for cell in row:
+                if cell.value is not None:
+                    cells += 1
+                    if isinstance(cell.value, str) and cell.value.startswith("="):
+                        formulas += 1
+                    values.append(f"{cell.coordinate}={cell.value}")
+            if values:
+                lines.append(" | ".join(values))
+    summary = {"Worksheets": len(wb.sheetnames), "Sheet details": sheets,
+               "Non-empty cells": cells, "Formula cells": formulas}
+    wb.close()
+    return {"lines": lines, "summary": summary, "warnings": []}
+
+
+def extract_pptx(data):
+    prs = Presentation(io.BytesIO(data))
+    lines, text_shapes = [], 0
+    for si, slide in enumerate(prs.slides, 1):
+        lines.append(f"SLIDE {si}")
+        for shape in slide.shapes:
+            if getattr(shape, "has_text_frame", False) and shape.text.strip():
+                text_shapes += 1
+                lines.append(shape.text)
+            if getattr(shape, "has_table", False):
+                for row in shape.table.rows:
+                    lines.append(" | ".join(cell.text for cell in row.cells))
+    return {"lines": lines, "summary": {
+        "Total slides": len(prs.slides), "Text-containing shapes": text_shapes,
+    }, "warnings": []}
+
+
+def extract_content(kind, data):
+    if kind.startswith("PDF"):
+        return extract_pdf(data)
+    if kind == "Word DOCX":
+        return extract_docx(data)
+    if kind == "Excel XLSX":
+        return extract_xlsx(data)
+    if kind == "PowerPoint PPTX":
+        return extract_pptx(data)
+    raise ValueError("Unsupported or damaged file format.")
+
+
+def inspect_file(kind, data):
+    findings, errors, warnings = [], [], []
+    if kind.startswith("PDF"):
+        if b"%PDF" not in data[:1024]:
+            warnings.append("PDF signature was not found near the start of the file.")
+    elif kind == "Word DOCX":
+        f, e = inspect_zip(data, "word/document.xml")
+        findings += f
+        errors += e
+    elif kind == "Excel XLSX":
+        f, e = inspect_zip(data, "xl/workbook.xml")
+        findings += f
+        errors += e
+    elif kind == "PowerPoint PPTX":
+        f, e = inspect_zip(data, "ppt/presentation.xml")
+        findings += f
+        errors += e
+    else:
+        errors.append("Unsupported or unrecognized file format.")
 
     try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
-            bad_file = z.testzip()
+        details = extract_content(kind, data)
+        findings.append("The document parser could read the file content.")
+        findings.append(f"Content summary: {details['summary']}")
+        warnings += details.get("warnings", [])
+        summary = details["summary"]
+        if kind.startswith("PDF") and summary["Pages"] and not summary["Pages with extractable text"]:
+            warnings.append("No extractable text found. This may be a scanned/image-only PDF.")
+        if kind == "Word DOCX" and not summary["Non-empty paragraphs"] and not summary["Tables"]:
+            warnings.append("No paragraph text or tables were found.")
+        if kind == "Excel XLSX" and not summary["Non-empty cells"]:
+            warnings.append("No non-empty cells were found.")
+        if kind == "PowerPoint PPTX" and not summary["Total slides"]:
+            warnings.append("The presentation contains no slides.")
+    except Exception as exc:
+        errors.append(f"Content parsing failed: {exc}")
 
-            if bad_file:
-                return False, f"Damaged internal component: {bad_file}"
-
-        return True, "Office file structure is readable."
-
-    except Exception as e:
-        return False, str(e)
-
-
-# ---------------- PDF REPAIR ----------------
-
-def repair_pdf(file_bytes):
-
-    reader = PdfReader(
-        io.BytesIO(file_bytes),
-        strict=False
-    )
-
-    if reader.is_encrypted:
-        raise ValueError(
-            "Password-protected PDFs are not supported."
-        )
-
-    writer = PdfWriter()
-
-    for page in reader.pages:
-        writer.add_page(page)
-
-    if reader.metadata:
-        metadata = {}
-
-        for key, value in reader.metadata.items():
-            if value is not None:
-                metadata[str(key)] = str(value)
-
-        if metadata:
-            writer.add_metadata(metadata)
-
-    output = io.BytesIO()
-    writer.write(output)
-
-    return output.getvalue(), {
-        "Pages": len(reader.pages),
-        "Metadata fields": len(reader.metadata or {})
-    }
+    return {"findings": findings, "errors": errors, "warnings": warnings}
 
 
-# ---------------- WORD REPAIR ----------------
+# ---------- Re-save supported files ----------
 
-def repair_word(file_bytes):
+def repair_file(kind, data):
+    if kind.startswith("PDF"):
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        if reader.is_encrypted:
+            raise ValueError("Password-protected PDFs are not supported.")
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        if reader.metadata:
+            metadata = {str(k): str(v) for k, v in reader.metadata.items() if v is not None}
+            if metadata:
+                writer.add_metadata(metadata)
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue(), "application/pdf", ".pdf"
 
-    doc = Document(io.BytesIO(file_bytes))
+    if kind == "Word DOCX":
+        doc = Document(io.BytesIO(data))
+        out = io.BytesIO()
+        doc.save(out)
+        return out.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"
 
-    paragraph_count = len(doc.paragraphs)
-    table_count = len(doc.tables)
+    if kind == "Excel XLSX":
+        wb = load_workbook(io.BytesIO(data), data_only=False, keep_links=True)
+        out = io.BytesIO()
+        wb.save(out)
+        wb.close()
+        return out.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"
 
-    output = io.BytesIO()
-    doc.save(output)
+    if kind == "PowerPoint PPTX":
+        prs = Presentation(io.BytesIO(data))
+        out = io.BytesIO()
+        prs.save(out)
+        return out.getvalue(), "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"
 
-    return output.getvalue(), {
-        "Paragraphs": paragraph_count,
-        "Tables": table_count
-    }
-
-
-# ---------------- EXCEL REPAIR ----------------
-
-def repair_excel(file_bytes):
-
-    workbook = load_workbook(
-        io.BytesIO(file_bytes),
-        data_only=False,
-        keep_links=True
-    )
-
-    sheet_details = {}
-
-    for sheet in workbook.worksheets:
-
-        sheet_details[sheet.title] = {
-            "Rows": sheet.max_row,
-            "Columns": sheet.max_column
-        }
-
-    output = io.BytesIO()
-
-    workbook.save(output)
-
-    return output.getvalue(), {
-        "Worksheets": len(workbook.sheetnames),
-        "Sheet details": sheet_details
-    }
+    raise ValueError("Unsupported file format.")
 
 
-# ---------------- POWERPOINT REPAIR ----------------
-
-def repair_powerpoint(file_bytes):
-
-    presentation = Presentation(
-        io.BytesIO(file_bytes)
-    )
-
-    slide_count = len(presentation.slides)
-
-    output = io.BytesIO()
-    presentation.save(output)
-
-    return output.getvalue(), {
-        "Total slides": slide_count
-    }
+def compare_files(kind, original, repaired):
+    before = extract_content(kind, original)
+    after = extract_content(kind, repaired)
+    diff = list(difflib.unified_diff(
+        before["lines"], after["lines"],
+        fromfile="Original", tofile="Repaired", lineterm=""
+    ))
+    added = sum(1 for x in diff if x.startswith("+") and not x.startswith("+++"))
+    removed = sum(1 for x in diff if x.startswith("-") and not x.startswith("---"))
+    return before, after, diff, added, removed
 
 
-# ---------------- FILE UPLOAD ----------------
+# ---------- Website UI ----------
+
+st.title("🛠️ DataFix")
+st.subheader("Universal File Identification & Repair Center")
+st.write(
+    "Inspect files before repair, identify readable structural problems, "
+    "compare original and repaired content, and download the repaired file."
+)
+st.divider()
+st.info("Supported formats: PDF, Word DOCX, Excel XLSX and PowerPoint PPTX.")
 
 st.header("📁 Upload Your File")
-
-uploaded_file = st.file_uploader(
+uploaded = st.file_uploader(
     "Choose a PDF, Word, Excel or PowerPoint file",
     type=["pdf", "docx", "xlsx", "pptx"],
     help="Upload one file at a time."
 )
 
-
-if uploaded_file is not None:
-
-    original_bytes = uploaded_file.getvalue()
-    file_name = uploaded_file.name
-
-    file_type = identify_file(file_name, original_bytes)
+if uploaded:
+    original = uploaded.getvalue()
+    filename = uploaded.name
+    kind = identify_file(filename, original)
 
     st.divider()
-
     st.header("📋 File Information")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("File name", filename)
+    c2.metric("File format", kind)
+    c3.metric("File size", f"{len(original) / 1024:.2f} KB")
 
-    col1, col2, col3 = st.columns(3)
+    st.divider()
+    st.header("🔍 1. Pre-repair Error Inspection")
+    st.write("Inspection date:", datetime.now().strftime("%d-%m-%Y %H:%M:%S"))
+    inspection = inspect_file(kind, original)
 
-    col1.metric("File name", file_name)
-    col2.metric("File format", file_type)
-    col3.metric(
-        "File size",
-        f"{len(original_bytes) / 1024:.2f} KB"
+    if inspection["errors"]:
+        st.error("Potential structural or reading problems were detected.")
+    else:
+        st.success("The file passed the available structure and readability checks.")
+
+    if inspection["findings"]:
+        st.markdown("**Inspection findings**")
+        for item in inspection["findings"]:
+            st.write("•", item)
+    if inspection["warnings"]:
+        st.markdown("**Warnings**")
+        for item in inspection["warnings"]:
+            st.warning(item)
+    if inspection["errors"]:
+        st.markdown("**Errors**")
+        for item in inspection["errors"]:
+            st.error(item)
+
+    st.caption(
+        "These checks detect issues visible to the supported parsers. "
+        "They cannot identify every possible content, formatting, or application-specific defect."
     )
 
     st.divider()
+    st.header("🛠️ 2. Repair File")
+    if st.button("🛠️ Repair File", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Rebuilding and verifying the document..."):
+                repaired, mime, ext = repair_file(kind, original)
+                repaired_name = os.path.splitext(filename)[0] + "_repaired" + ext
 
-    st.header("🔍 File Inspection Report")
+                # Re-open the generated file to verify that it remains readable.
+                output_check = inspect_file(kind, repaired)
+                if output_check["errors"]:
+                    raise ValueError("Output verification failed: " + "; ".join(output_check["errors"]))
 
-    st.write("**Inspection date:**", datetime.now().strftime(
-        "%d-%m-%Y %H:%M:%S"
-    ))
+                before, after, diff, added, removed = compare_files(kind, original, repaired)
+                st.session_state["datafix_result"] = {
+                    "filename": filename, "repaired_name": repaired_name,
+                    "repaired": repaired, "mime": mime, "before": before,
+                    "after": after, "diff": diff, "added": added,
+                    "removed": removed, "output_check": output_check,
+                }
+        except Exception as exc:
+            st.session_state.pop("datafix_result", None)
+            st.error(f"Repair was unsuccessful: {exc}")
+            st.warning("The original upload has not been changed.")
 
-    if file_type == "Damaged Office file":
-        st.error(
-            "The Office file is not a readable ZIP document. "
-            "Automatic repair may not be possible."
-        )
+    result = st.session_state.get("datafix_result")
+    if result and result["filename"] == filename:
+        st.success("Repaired output generated and passed the available readability checks.")
 
-    elif file_type == "Unsupported file format":
-        st.error("This file format is not supported.")
+        st.header("📊 3. Repair Report")
+        a, b, c = st.columns(3)
+        a.metric("Original size", f"{len(original) / 1024:.2f} KB")
+        b.metric("Repaired size", f"{len(result['repaired']) / 1024:.2f} KB")
+        c.metric("Detected content differences", result["added"] + result["removed"])
+        st.write("**Original file:**", filename)
+        st.write("**Repaired file:**", result["repaired_name"])
+        st.write("**Original format preserved:**", kind)
+        st.write("**Output verification:** Passed")
 
-    else:
+        st.divider()
+        st.header("🔄 4. Original vs Repaired Comparison")
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Original file")
+            st.json(result["before"]["summary"])
+        with right:
+            st.subheader("Repaired file")
+            st.json(result["after"]["summary"])
 
-        if file_type in ["Word DOCX", "Excel XLSX", "PowerPoint PPTX"]:
+        x, y = st.columns(2)
+        x.metric("Content lines added", result["added"])
+        y.metric("Content lines removed/changed", result["removed"])
 
-            zip_ok, zip_message = check_zip(original_bytes)
-
-            if not zip_ok:
-                st.error(zip_message)
-
-            else:
-                st.success(zip_message)
-
-        if file_type == "PDF (signature warning)":
-            st.warning(
-                "The PDF extension was detected, but its signature "
-                "could not be verified."
+        if result["diff"]:
+            st.markdown("**Detected text / cell / content differences**")
+            st.code("\n".join(result["diff"][:120]), language="diff")
+            if len(result["diff"]) > 120:
+                st.info("Only the first 120 difference lines are displayed.")
+        else:
+            st.success(
+                "No extracted text, paragraph, slide-text, or cell-value differences were found. "
+                "Internal formatting or binary changes may still exist."
             )
 
-        st.info(
-            "The repair engine will attempt to read and rebuild "
-            "the supported document structure."
+        if kind.startswith("PDF"):
+            with st.expander("Original PDF metadata"):
+                st.json(result["before"].get("metadata", {}))
+            with st.expander("Repaired PDF metadata"):
+                st.json(result["after"].get("metadata", {}))
+
+        st.divider()
+        st.header("⬇️ 5. Download")
+        st.download_button(
+            "⬇️ Download Repaired File",
+            data=result["repaired"],
+            file_name=result["repaired_name"],
+            mime=result["mime"],
+            use_container_width=True,
+        )
+        st.caption(
+            "DataFix re-saves files using supported Python libraries. This does not guarantee "
+            "that all corruption has been recovered. Review important files and compare them "
+            "with the original before relying on the repaired copy."
         )
 
-        if st.button(
-            "🛠️ Repair File",
-            type="primary",
-            use_container_width=True
-        ):
-
-            try:
-
-                with st.spinner(
-                    "Inspecting and attempting to repair your file..."
-                ):
-
-                    if file_type in ["PDF", "PDF (signature warning)"]:
-
-                        repaired_bytes, report = repair_pdf(
-                            original_bytes
-                        )
-
-                        repaired_name = (
-                            os.path.splitext(file_name)[0]
-                            + "_repaired.pdf"
-                        )
-
-                        mime = "application/pdf"
-
-                    elif file_type == "Word DOCX":
-
-                        repaired_bytes, report = repair_word(
-                            original_bytes
-                        )
-
-                        repaired_name = (
-                            os.path.splitext(file_name)[0]
-                            + "_repaired.docx"
-                        )
-
-                        mime = (
-                            "application/vnd.openxmlformats-officedocument."
-                            "wordprocessingml.document"
-                        )
-
-                    elif file_type == "Excel XLSX":
-
-                        repaired_bytes, report = repair_excel(
-                            original_bytes
-                        )
-
-                        repaired_name = (
-                            os.path.splitext(file_name)[0]
-                            + "_repaired.xlsx"
-                        )
-
-                        mime = (
-                            "application/vnd.openxmlformats-officedocument."
-                            "spreadsheetml.sheet"
-                        )
-
-                    elif file_type == "PowerPoint PPTX":
-
-                        repaired_bytes, report = repair_powerpoint(
-                            original_bytes
-                        )
-
-                        repaired_name = (
-                            os.path.splitext(file_name)[0]
-                            + "_repaired.pptx"
-                        )
-
-                        mime = (
-                            "application/vnd.openxmlformats-officedocument."
-                            "presentationml.presentation"
-                        )
-
-                    else:
-                        raise ValueError("Unsupported file type.")
-
-                    # Verify the generated output can be reopened
-
-                    if file_type in ["PDF", "PDF (signature warning)"]:
-                        PdfReader(io.BytesIO(repaired_bytes))
-
-                    elif file_type == "Word DOCX":
-                        Document(io.BytesIO(repaired_bytes))
-
-                    elif file_type == "Excel XLSX":
-                        load_workbook(
-                            io.BytesIO(repaired_bytes),
-                            read_only=True
-                        ).close()
-
-                    elif file_type == "PowerPoint PPTX":
-                        Presentation(io.BytesIO(repaired_bytes))
-
-                    st.success(
-                        "File successfully processed and output verified!"
-                    )
-
-                    st.header("📊 Repair Report")
-
-                    st.json(report)
-
-                    st.write(
-                        "**Original file:**", file_name
-                    )
-
-                    st.write(
-                        "**Repaired file:**", repaired_name
-                    )
-
-                    st.write(
-                        "**Original format preserved:**",
-                        file_type
-                    )
-
-                    st.write(
-                        "**Output size:**",
-                        f"{len(repaired_bytes) / 1024:.2f} KB"
-                    )
-
-                    st.download_button(
-                        label="⬇️ Download Repaired File",
-                        data=repaired_bytes,
-                        file_name=repaired_name,
-                        mime=mime,
-                        use_container_width=True
-                    )
-
-                    st.caption(
-                        "Your original uploaded file has not been changed. "
-                        "Compare the repaired copy with your original "
-                        "before relying on it."
-                    )
-
-            except Exception as e:
-
-                st.error(
-                    f"Repair was unsuccessful: {str(e)}"
-                )
-
-                st.warning(
-                    "The file may be severely damaged, encrypted, "
-                    "or contain unsupported features. "
-                    "Your original file remains unchanged."
-                )
-
-
-# ---------------- FOOTER ----------------
-
 st.divider()
-
-st.caption(
-    "🛠️ DataFix | Universal File Identification & Repair Center"
-)
-
-st.caption(
-    "PDF • Word • Excel • PowerPoint | "
-    "Original uploads are preserved."
-)
+st.caption("🛠️ DataFix | Universal File Identification & Repair Center")
+st.caption("PDF • Word • Excel • PowerPoint | Original uploads are preserved.")
