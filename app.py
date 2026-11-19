@@ -1,11 +1,12 @@
+import streamlit as st
 import io
 import os
 import re
 import zipfile
 from datetime import datetime
 from collections import Counter
+from copy import copy
 
-import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -41,13 +42,14 @@ st.info(
 # ================= GENERAL HELPERS =================
 
 def normalize_text(value, fix_spacing=True):
+
     if value is None:
         return value
 
     text = str(value).replace("\u00a0", " ")
 
     if fix_spacing:
-        # Join obvious letter-spaced words.
+
         text = re.sub(
             r"(?<![\w])(?:[A-Za-z]\s+){2,}[A-Za-z](?![\w])",
             lambda m: re.sub(r"\s+", "", m.group(0)),
@@ -63,6 +65,7 @@ def normalize_text(value, fix_spacing=True):
 
 
 def rgb_from_hex(color):
+
     value = color.lstrip("#")
 
     if len(value) != 6:
@@ -75,6 +78,7 @@ def rgb_from_hex(color):
 
 
 def add_finding(findings, category, location, detail):
+
     findings.append({
         "Category": category,
         "Location": location,
@@ -87,11 +91,14 @@ def identify_file(name, data):
     ext = os.path.splitext(name)[1].lower()
 
     if ext == ".pdf":
+
         if b"%PDF" in data[:1024]:
             return "PDF"
+
         return "PDF (signature warning)"
 
     try:
+
         with zipfile.ZipFile(io.BytesIO(data)) as z:
 
             if z.testzip():
@@ -109,6 +116,7 @@ def identify_file(name, data):
                 return "PowerPoint PPTX"
 
     except Exception:
+
         if ext in [".docx", ".xlsx", ".pptx"]:
             return "Damaged Office file"
 
@@ -123,8 +131,11 @@ def get_word_paragraphs(doc):
         yield p
 
     for table in doc.tables:
+
         for row in table.rows:
+
             for cell in row.cells:
+
                 for p in cell.paragraphs:
                     yield p
 
@@ -132,10 +143,12 @@ def get_word_paragraphs(doc):
 def set_word_text(paragraph, text):
 
     if paragraph.runs:
+
         paragraph.runs[0].text = text
 
         for run in paragraph.runs[1:]:
             run.text = ""
+
     else:
         paragraph.add_run(text)
 
@@ -162,7 +175,9 @@ def inspect_word(data):
     findings = []
 
     for text, count in counts.items():
+
         if count > 1:
+
             add_finding(
                 findings,
                 "Duplicate paragraph",
@@ -173,6 +188,7 @@ def inspect_word(data):
     for index, p in enumerate(paragraphs, 1):
 
         if re.search(r"[ \t]{2,}|[ \t]+[,.!?;:]", p.text):
+
             add_finding(
                 findings,
                 "Spacing",
@@ -195,6 +211,7 @@ def inspect_word(data):
     )
 
     if len(sizes) > 1:
+
         add_finding(
             findings,
             "Font size inconsistency",
@@ -203,6 +220,7 @@ def inspect_word(data):
         )
 
     if len(colours) > 1:
+
         add_finding(
             findings,
             "Font colour inconsistency",
@@ -237,12 +255,17 @@ def clean_word(data, options):
             if key and key in seen:
 
                 try:
+
                     p._element.getparent().remove(p._element)
+
                     changes["Duplicate paragraphs removed"] += 1
+
                 except Exception:
+
                     changes["Duplicate paragraphs not removed"] += 1
 
             elif key:
+
                 seen.add(key)
 
     for p in get_word_paragraphs(doc):
@@ -253,19 +276,23 @@ def clean_word(data, options):
             new = normalize_text(old)
 
             if new != old:
+
                 set_word_text(p, new)
                 changes["Paragraphs corrected"] += 1
 
         for run in p.runs:
 
             if options["font_size"]:
+
                 run.font.size = Pt(options["font_size_value"])
                 changes["Font sizes corrected"] += 1
 
             if options["font_color"]:
+
                 run.font.color.rgb = RGBColor(
                     *rgb_from_hex(options["font_color_value"])
                 )
+
                 changes["Font colours corrected"] += 1
 
     output = io.BytesIO()
@@ -324,6 +351,7 @@ def inspect_excel(data):
                 )
 
             else:
+
                 seen[key] = row
 
             for col in range(1, ws.max_column + 1):
@@ -353,9 +381,11 @@ def inspect_excel(data):
                         and cell.font.color.type == "rgb"
                         and cell.font.color.rgb
                     ):
+
                         colours[str(cell.font.color.rgb)] += 1
 
         if len(sizes) > 1:
+
             add_finding(
                 findings,
                 "Font size inconsistency",
@@ -364,6 +394,7 @@ def inspect_excel(data):
             )
 
         if len(colours) > 1:
+
             add_finding(
                 findings,
                 "Font colour inconsistency",
@@ -413,10 +444,12 @@ def clean_excel(data, options):
 
                 if key in seen:
                     duplicates.append(row)
+
                 else:
                     seen.add(key)
 
             for row in reversed(duplicates):
+
                 ws.delete_rows(row, 1)
                 changes["Duplicate rows removed"] += 1
 
@@ -429,17 +462,19 @@ def clean_excel(data, options):
                     new = normalize_text(cell.value)
 
                     if new != cell.value:
+
                         cell.value = new
                         changes["Cells corrected"] += 1
 
                 if options["font_size"] or options["font_color"]:
 
-                    font = cell.font.copy()
+                    font = copy(cell.font)
 
                     if options["font_size"]:
                         font.sz = options["font_size_value"]
 
                     if options["font_color"]:
+
                         font.color = options["font_color_value"].replace(
                             "#", ""
                         ).upper()
@@ -513,6 +548,7 @@ def inspect_powerpoint(data):
     for text, count in counts.items():
 
         if count > 1:
+
             add_finding(
                 findings,
                 "Duplicate text",
@@ -527,13 +563,24 @@ def inspect_powerpoint(data):
         if run.font.size
     )
 
-    colours = Counter(
-        str(run.font.color.rgb)
-        for _, _, p in paragraphs
-        for run in p.runs
-        if run.font.color.type == MSO_COLOR_TYPE.RGB
-        and run.font.color.rgb is not None
-    )
+    colours = Counter()
+
+    for _, _, p in paragraphs:
+
+        for run in p.runs:
+
+            try:
+
+                if (
+                    run.font.color.type == MSO_COLOR_TYPE.RGB
+                    and run.font.color.rgb is not None
+                ):
+
+                    colours[str(run.font.color.rgb)] += 1
+
+            except (AttributeError, TypeError):
+
+                continue
 
     for slide_no, shape_no, p in paragraphs:
 
@@ -547,6 +594,7 @@ def inspect_powerpoint(data):
             )
 
     if len(sizes) > 1:
+
         add_finding(
             findings,
             "Font size inconsistency",
@@ -555,6 +603,7 @@ def inspect_powerpoint(data):
         )
 
     if len(colours) > 1:
+
         add_finding(
             findings,
             "Font colour inconsistency",
@@ -586,13 +635,17 @@ def clean_powerpoint(data, options):
             if key in seen:
 
                 try:
+
                     p._p.getparent().remove(p._p)
                     changes["Duplicate paragraphs removed"] += 1
                     continue
+
                 except Exception:
+
                     changes["Duplicate paragraphs not removed"] += 1
 
             else:
+
                 seen.add(key)
 
         if options["fix_spacing"]:
@@ -601,6 +654,7 @@ def clean_powerpoint(data, options):
             new = normalize_text(old)
 
             if new != old:
+
                 set_ppt_text(p, new)
                 changes["Spacing corrected"] += 1
 
@@ -686,7 +740,6 @@ def inspect_pdf(data):
     lines = get_pdf_lines(data)
 
     findings = []
-
     seen = set()
 
     for line in lines:
@@ -698,12 +751,13 @@ def inspect_pdf(data):
 
             add_finding(
                 findings,
-                "Duplicate text line",
+                "Repeated text line",
                 f"Page {line['page'] + 1}",
                 text[:120]
             )
 
         elif key:
+
             seen.add(key)
 
         if text != line["text"]:
@@ -726,6 +780,7 @@ def inspect_pdf(data):
     )
 
     if len(sizes) > 1:
+
         add_finding(
             findings,
             "Font size inconsistency",
@@ -734,6 +789,7 @@ def inspect_pdf(data):
         )
 
     if len(colours) > 1:
+
         add_finding(
             findings,
             "Font colour inconsistency",
@@ -753,143 +809,40 @@ def inspect_pdf(data):
 
 def clean_pdf(data, options):
 
+    """
+    PDF SAFE MODE.
+
+    Never redact, erase, or rewrite original PDF content.
+    Return the original PDF bytes unchanged to preserve:
+    - Bank statements
+    - Tables and transaction rows
+    - Debit and credit amounts
+    - Highlighted text
+    - Images and graphics
+    - Original page layout
+    """
+
     doc = fitz.open(
         stream=data,
         filetype="pdf"
     )
 
-    lines = get_pdf_lines(data)
-    changes = Counter()
-    seen = set()
-    replacements = []
+    if doc.is_encrypted:
 
-    for item in lines:
+        doc.close()
 
-        original = item["text"]
-
-        cleaned = normalize_text(
-            original,
-            options["fix_spacing"]
+        raise ValueError(
+            "Password-protected PDFs are not supported."
         )
 
-        key = cleaned.casefold()
-
-        duplicate = (
-            options["remove_duplicates"]
-            and key
-            and key in seen
-        )
-
-        if key and not duplicate:
-            seen.add(key)
-
-        if duplicate:
-
-            changes["Duplicate text lines removed"] += 1
-            replacements.append((item, None))
-
-        elif (
-            cleaned != original
-            or options["font_size"]
-            or options["font_color"]
-        ):
-
-            if cleaned != original:
-                changes["Spacing corrected"] += 1
-
-            if options["font_size"]:
-                changes["Font size applied"] += 1
-
-            if options["font_color"]:
-                changes["Font colour applied"] += 1
-
-            replacements.append((item, cleaned))
-
-    per_page = {}
-
-    for item, replacement in replacements:
-
-        page = doc[item["page"]]
-
-        page.add_redact_annot(
-            item["bbox"],
-            fill=(1, 1, 1)
-        )
-
-        per_page.setdefault(
-            item["page"], []
-        ).append((item, replacement))
-
-    for page_no in per_page:
-        doc[page_no].apply_redactions(
-            images=0,
-            graphics=0
-        )
-
-    target_color = (
-        rgb_from_hex(options["font_color_value"])
-        if options["font_color"]
-        else None
-    )
-
-    for page_no, entries in per_page.items():
-
-        page = doc[page_no]
-
-        for item, replacement in entries:
-
-            if replacement is None:
-                continue
-
-            size = (
-                options["font_size_value"]
-                if options["font_size"]
-                else max(5, float(item["size"]))
-            )
-
-            color = target_color if target_color else (
-                (
-                    (item["color"] >> 16 & 255) / 255,
-                    (item["color"] >> 8 & 255) / 255,
-                    (item["color"] & 255) / 255
-                )
-            )
-
-            rect = fitz.Rect(item["bbox"])
-
-            rect.x0 += 0.3
-            rect.y0 += 0.2
-            rect.x1 -= 0.3
-            rect.y1 -= 0.2
-
-            inserted = False
-
-            for attempt in range(4):
-
-                result = page.insert_textbox(
-                    rect,
-                    replacement,
-                    fontname="helv",
-                    fontsize=max(4, size - attempt * 0.5),
-                    color=color,
-                    overlay=True
-                )
-
-                if result >= 0:
-                    inserted = True
-                    break
-
-            if not inserted:
-                changes["Lines needing manual review"] += 1
-
-    output = doc.tobytes(
-        garbage=4,
-        deflate=True
-    )
-
+    page_count = len(doc)
     doc.close()
 
-    return output, dict(changes)
+    return data, {
+        "PDF pages preserved": page_count,
+        "PDF content modifications": 0,
+        "Original PDF content preserved": True
+    }
 
 
 # ================= PROCESS ROUTER =================
@@ -932,10 +885,28 @@ def verify_file(file_type, data):
 
     if file_type.startswith("PDF"):
 
-        reader = PdfReader(io.BytesIO(data), strict=False)
+        reader = PdfReader(
+            io.BytesIO(data),
+            strict=False
+        )
+
+        pages = len(reader.pages)
+
+        # Also check that PyMuPDF can open the generated PDF.
+        doc = fitz.open(
+            stream=data,
+            filetype="pdf"
+        )
+
+        if len(doc) != pages:
+            doc.close()
+            raise ValueError("PDF page count verification failed.")
+
+        doc.close()
 
         return {
-            "Pages": len(reader.pages)
+            "Pages": pages,
+            "PDF readability": "Passed"
         }
 
     if file_type == "Word DOCX":
@@ -943,14 +914,16 @@ def verify_file(file_type, data):
         doc = Document(io.BytesIO(data))
 
         return {
-            "Paragraphs": len(list(get_word_paragraphs(doc)))
+            "Paragraphs": len(list(get_word_paragraphs(doc))),
+            "Tables": len(doc.tables)
         }
 
     if file_type == "Excel XLSX":
 
         wb = load_workbook(
             io.BytesIO(data),
-            read_only=True
+            read_only=True,
+            data_only=False
         )
 
         result = {
@@ -990,6 +963,12 @@ if uploaded:
         filename,
         original
     )
+
+    # Clear an old result when another file is uploaded.
+    previous_result = st.session_state.get("datafix_result")
+
+    if previous_result and previous_result.get("filename") != filename:
+        st.session_state.pop("datafix_result", None)
 
     st.divider()
 
@@ -1061,19 +1040,35 @@ if uploaded:
                 "you want DataFix to perform."
             )
 
+            is_pdf = file_type.startswith("PDF")
+
+            if is_pdf:
+
+                st.warning(
+                    "PDF SAFE MODE is enabled. DataFix can inspect "
+                    "your PDF, but automatic PDF text deletion, "
+                    "spacing replacement, font-size changes and "
+                    "font-colour changes are disabled. This protects "
+                    "bank statements, tables, transaction amounts, "
+                    "highlights and page layout."
+                )
+
             remove_duplicates = st.checkbox(
                 "Detect and remove duplicate data",
-                value=True
+                value=True,
+                disabled=is_pdf
             )
 
             fix_spacing = st.checkbox(
                 "Correct extra spaces and letter spacing",
-                value=True
+                value=True,
+                disabled=is_pdf
             )
 
             font_size = st.checkbox(
                 "Standardize font size",
-                value=False
+                value=False,
+                disabled=is_pdf
             )
 
             font_size_value = st.number_input(
@@ -1082,27 +1077,28 @@ if uploaded:
                 max_value=48.0,
                 value=11.0,
                 step=1.0,
-                disabled=not font_size
+                disabled=is_pdf or not font_size
             )
 
             font_color = st.checkbox(
                 "Standardize font colour",
-                value=False
+                value=False,
+                disabled=is_pdf
             )
 
             font_color_value = st.color_picker(
                 "Choose font colour",
                 value="#000000",
-                disabled=not font_color
+                disabled=is_pdf or not font_color
             )
 
-            st.warning(
-                "PDF text correction can change page layout and uses "
-                "a standard font when reinserting text. Scanned PDFs "
-                "require OCR. Complex formatting, graphics, embedded "
-                "fonts and annotations may not be preserved. "
-                "Always inspect the downloaded copy."
-            )
+            if not is_pdf:
+
+                st.warning(
+                    "Automatic duplicate removal may remove "
+                    "intentional repeated content. Review the original "
+                    "and cleaned document carefully."
+                )
 
             options = {
                 "remove_duplicates": remove_duplicates,
@@ -1121,7 +1117,7 @@ if uploaded:
                 use_container_width=True
             ):
 
-                if not any([
+                if not is_pdf and not any([
                     remove_duplicates,
                     fix_spacing,
                     font_size,
@@ -1135,7 +1131,7 @@ if uploaded:
                 else:
 
                     with st.spinner(
-                        "Cleaning and verifying your file..."
+                        "Processing and verifying your file..."
                     ):
 
                         cleaned, changes = clean_file(
@@ -1154,6 +1150,15 @@ if uploaded:
                             cleaned
                         )
 
+                    # Additional PDF safety check:
+                    # The output must be byte-for-byte identical.
+                    if is_pdf and cleaned != original:
+
+                        raise ValueError(
+                            "PDF safety verification failed. "
+                            "The original PDF was not preserved."
+                        )
+
                     ext = os.path.splitext(filename)[1].lower()
 
                     cleaned_name = (
@@ -1169,105 +1174,152 @@ if uploaded:
                         ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                     }
 
-                    st.success(
-                        "Cleaning completed and output passed readability verification."
-                    )
-
-                    st.header("📊 3. Cleaning Report")
-
-                    a, b, c = st.columns(3)
-
-                    a.metric(
-                        "Original Size",
-                        f"{len(original) / 1024:.2f} KB"
-                    )
-
-                    b.metric(
-                        "Cleaned Size",
-                        f"{len(cleaned) / 1024:.2f} KB"
-                    )
-
-                    c.metric(
-                        "Changes Recorded",
-                        sum(changes.values())
-                    )
-
-                    st.write("**Original file:**", filename)
-
-                    st.write("**Cleaned file:**", cleaned_name)
-
-                    st.write("**Format preserved:**", file_type)
-
-                    st.write("**Output verification:** Passed")
-
-                    st.subheader("Changes performed")
-
-                    if changes:
-                        st.json(changes)
-                    else:
-                        st.info(
-                            "No selected corrections were required "
-                            "or applied."
-                        )
-
-                    st.subheader("Output verification")
-
-                    st.json(verification)
-
-                    st.divider()
-
-                    st.header("🔄 4. Before and After Comparison")
-
-                    left, right = st.columns(2)
-
-                    with left:
-
-                        st.subheader("Original File")
-
-                        st.json(inspection["summary"])
-
-                    with right:
-
-                        st.subheader("Cleaned File")
-
-                        st.json(after["summary"])
-
-                    st.subheader("Remaining findings")
-
-                    if after["findings"]:
-
-                        st.dataframe(
-                            after["findings"],
-                            use_container_width=True,
-                            hide_index=True
-                        )
-
-                    else:
-
-                        st.success(
-                            "No findings from the supported checks remain."
-                        )
-
-                    st.divider()
-
-                    st.header("⬇️ 5. Download Cleaned File")
-
-                    st.download_button(
-                        label="Download Cleaned File",
-                        data=cleaned,
-                        file_name=cleaned_name,
-                        mime=mime_types.get(
+                    st.session_state["datafix_result"] = {
+                        "filename": filename,
+                        "cleaned_name": cleaned_name,
+                        "cleaned": cleaned,
+                        "changes": changes,
+                        "verification": verification,
+                        "after": after,
+                        "mime": mime_types.get(
                             ext,
                             "application/octet-stream"
-                        ),
-                        use_container_width=True
+                        )
+                    }
+
+            # Display stored result after button click.
+            result = st.session_state.get("datafix_result")
+
+            if result and result["filename"] == filename:
+
+                st.divider()
+
+                if is_pdf:
+
+                    st.success(
+                        "PDF safely preserved. Original text, tables, "
+                        "images, highlights and page layout have not "
+                        "been modified."
                     )
 
-                    st.caption(
-                        "The original uploaded file has not been changed. "
-                        "Keep it as a backup and compare the cleaned copy "
-                        "before relying on it."
+                else:
+
+                    st.success(
+                        "Cleaning completed and output passed "
+                        "the available readability checks."
                     )
+
+                st.header("📊 3. Cleaning Report")
+
+                a, b, c = st.columns(3)
+
+                a.metric(
+                    "Original Size",
+                    f"{len(original) / 1024:.2f} KB"
+                )
+
+                b.metric(
+                    "Cleaned Size",
+                    f"{len(result['cleaned']) / 1024:.2f} KB"
+                )
+
+                c.metric(
+                    "Changes Recorded",
+                    sum(result["changes"].values())
+                )
+
+                st.write("**Original file:**", filename)
+
+                st.write(
+                    "**Cleaned file:**",
+                    result["cleaned_name"]
+                )
+
+                st.write(
+                    "**Format preserved:**",
+                    file_type
+                )
+
+                st.write(
+                    "**Output verification:** Passed"
+                )
+
+                st.subheader("Changes performed")
+
+                if result["changes"]:
+
+                    st.json(result["changes"])
+
+                else:
+
+                    st.info(
+                        "No selected corrections were required "
+                        "or applied."
+                    )
+
+                st.subheader("Output verification")
+
+                st.json(result["verification"])
+
+                st.divider()
+
+                st.header("🔄 4. Before and After Comparison")
+
+                left, right = st.columns(2)
+
+                with left:
+
+                    st.subheader("Original File")
+
+                    st.json(inspection["summary"])
+
+                with right:
+
+                    st.subheader("Cleaned File")
+
+                    st.json(result["after"]["summary"])
+
+                st.subheader("Remaining findings")
+
+                if result["after"]["findings"]:
+
+                    st.dataframe(
+                        result["after"]["findings"],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                else:
+
+                    st.success(
+                        "No findings from the supported checks remain."
+                    )
+
+                if is_pdf:
+
+                    st.info(
+                        "PDF comparison: The original PDF bytes were "
+                        "preserved exactly. No PDF text, table or "
+                        "formatting changes were made."
+                    )
+
+                st.divider()
+
+                st.header("⬇️ 5. Download Cleaned File")
+
+                st.download_button(
+                    label="⬇️ Download Cleaned File",
+                    data=result["cleaned"],
+                    file_name=result["cleaned_name"],
+                    mime=result["mime"],
+                    use_container_width=True
+                )
+
+                st.caption(
+                    "The original uploaded file has not been changed. "
+                    "Keep it as a backup and compare the cleaned copy "
+                    "before relying on it."
+                )
 
         except Exception as e:
 
@@ -1287,10 +1339,10 @@ if uploaded:
 st.divider()
 
 st.caption(
-    "🛠️ DataFix | Universal File Repair & Cleaning Center"
+    "🛠️ DataFix | Universal File Identification & Repair Center"
 )
 
 st.caption(
     "PDF • Word • Excel • PowerPoint | "
-    "Original files are preserved."
+    "Original uploads are preserved."
 )
